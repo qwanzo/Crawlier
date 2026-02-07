@@ -1,0 +1,62 @@
+Crawlier
+├── README.md                 # Main documentation
+├── LICENSE                   # MIT License
+├── CONTRIBUTING.md           # Contribution guidelines
+├── CHANGELOG.md              # Version history and planned features
+├── MANIFEST.in               # Package manifest for PyPI
+├── .gitignore                # Git ignore rules
+├── requirements.txt          # Simple pip requirements
+├── setup.py                  # Traditional setup script
+├── pyproject.toml            # Modern Python packaging (PEP 517/518)
+│
+├── src/
+│   └── crawlier/             # Main package source
+│       ├── __init__.py       # Package initialization & public API
+│       ├── crawler.py        # Core Crawlier class and functions
+│       └── utils.py          # (optional) Utility functions
+│
+├── tests/
+│   ├── __init__.py           # Test package marker
+│   ├── conftest.py           # Pytest fixtures and configuration
+│   ├── test_crawlier.py      # Main unit tests
+│   └── test_*.py             # (optional) Additional test modules
+│
+└── output/                   # (Created at runtime) Crawl results
+
+
+FEATURES:
+- Proper src/ layout for better packaging
+- Comprehensive pyproject.toml with all PyPI metadata
+- setup.py for compatibility
+- MIT License included
+- Full test suite with pytest configuration
+- CONTRIBUTING.md for developers
+- CHANGELOG.md for version tracking
+- .gitignore for common Python artifacts
+- MANIFEST.in for package distribution
+
+
+TO UPLOAD TO PYPI:
+
+1. Update author and email in pyproject.toml and setup.py:
+   - Replace "Your Name" and "your.email@example.com"
+   - Update GitHub URL
+
+2. Move advanced_crawler.py content to src/crawlier/crawler.py
+
+3. Install build tools:
+   pip install build twine
+
+4. Build the package:
+   python -m build
+
+5. Upload to Test PyPI (recommended first):
+   twine upload --repository testpypi dist/*
+
+6. If successful, upload to PyPI:
+   twine upload dist/*
+
+
+TESTING LOCALLY:
+pip install -e ".[dev]"
+pytest --cov=crawlier

@@ -1,0 +1,12 @@
+
+requests
+beautifulsoup4
+lxml
+tqdm
+gradio
+dnspython
+
+# Notes:
+# - The Python standard library provides sqlite3, threading, argparse, urllib, csv, json, etc.
+# - Install with: pip install -r requirements.txt
+

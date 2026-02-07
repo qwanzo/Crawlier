@@ -1,0 +1,3 @@
+# Crawl queue - domains to process
+# Format: domain
+youtube.com

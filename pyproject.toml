@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crawlier"
+version = "0.0.5-beta"
+description = "A modern crawling library built completely from Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Pansilu Chethiya (yoohoo-dev)", email = "pansiluco@gmail.com"}]
+keywords = ["crawling", "scraping", "web", "http", "https"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "requests>=2.28.0",
+    "beautifulsoup4>=4.11.0",
+    "lxml>=4.9.0",
+    "dnspython>=2.2.0",
+    "tqdm>=4.64.0",
+    "gradio>=3.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.2.0",
+    "pytest-cov>=4.0.0",
+    "black>=22.0.0",
+    "flake8>=5.0.0",
+    "mypy>=0.991",
+]
+
+[project.urls]
+Homepage = "https://github.com/Qwanzo/Crawlier"
+Documentation = "https://github.com/Qwanzo/Crawlier#readme"
+Repository = "https://github.com/Qwanzo/Crawlier.git"
+BugTracker = "https://github.com/Qwanzo/Crawlier/issues"
+Changelog = "https://github.com/Qwanzo/Crawlier/blob/main/CHANGELOG.md"
+Contributing = "https://github.com/Qwanzo/Crawlier/blob/main/CONTRIBUTING.md"
+OutputGuide = "https://github.com/Qwanzo/Crawlier/blob/main/OUTPUT_GUIDE.md"
+OutputDirectory = "https://github.com/Qwanzo/Crawlier/blob/main/OUTPUT_DIRECTORY_GUIDE.md"
+QuickStart = "https://github.com/Qwanzo/Crawlier/blob/main/README.md"
+
+[project.scripts]
+crawlier = "crawlier.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "--cov=crawlier --cov-report=html --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["crawlier"]
+omit = ["*/tests/*"]
