@@ -45,7 +45,7 @@ class PostInstallCommand(install):
 
 setup(
     name="crawlier",
-    version="0.0.5-beta",
+    version="1.0.1",
     author="Pansilu Chethiya (yoohoo-dev)",
     author_email="pansiluco@gmail.com",
     description="A modern Crawling library built completely from Python",
