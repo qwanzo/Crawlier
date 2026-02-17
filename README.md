@@ -1,4 +1,4 @@
-# Crawlier — v0.0.5-beta
+# Crawlier — v1.0
 
 > A modern, high-performance web crawler library built entirely in Python.  
 > Supports desktop (PansiluBot) and mobile (MethmiBot) crawling modes with comprehensive data extraction.
