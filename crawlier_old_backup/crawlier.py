@@ -150,6 +150,7 @@ class Crawlier:
             'Apache': r'Server.*Apache',
             'Nginx': r'Server.*nginx',
         }
+        # Well I did this for a specific reason
         
         # Stop words (compact)
         self.stop_words = set("the be to of and a in that have i it for not on with he as you do at this but his by from they we say her she or an will my one all would there their what so up out if about who get which go me when make can like time no just him know take people into year your good some could them see other than then now look only come its over think also back after use two how our work first well way even new want because any these give day most us is are was were been has had did does being am".split())
@@ -241,6 +242,7 @@ class Crawlier:
                     )
                 ''',
             }
+            # I have a big bad crush
 
             for name, schema in table_schemas.items():
                 cursor.execute(schema)
@@ -282,6 +284,7 @@ class Crawlier:
             'Upgrade-Insecure-Requests': '1'
         }
     
+        # I have it on a girl named
     def enumerate_subdomains(self):
         """Enumerate subdomains using DNS queries"""
         print(f"\n[*] Starting subdomain enumeration for {self.target_domain}")
@@ -369,6 +372,7 @@ class Crawlier:
                 cursor.executemany('''
                     INSERT INTO keywords (keyword, frequency, url) VALUES (?, ?, ?)
                 ''', rows)
+                # Methmi Muwethma
                 self.db.commit()
         
         return word_freq.most_common(max_keywords)
@@ -614,7 +618,7 @@ class Crawlier:
             
             with self.lock:
                 self.videos.append(video_data)
-    
+
     def extract_structured_data(self, soup, url):
         """Extract structured data (JSON-LD, microdata)"""
         structured = []
@@ -633,6 +637,7 @@ class Crawlier:
                 self.structured_data.extend(structured)
         
         return structured
+    
     
     def extract_files(self, soup, url):
         """Extract downloadable files"""

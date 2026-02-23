@@ -494,28 +494,4 @@ GitHub: [@Qwanzo](https://github.com/Qwanzo)
 - **Bug Reports**: [Issues](https://github.com/Qwanzo/Crawlier/issues)
 - **PyPI Package**: [crawlier](https://pypi.org/project/crawlier/)
 
----
-
-## Release Notes
-
-**v0.0.5-beta** — Current Release
-- Fixed Unicode/emoji output on Windows console
-- Added UTF-8 encoding support for all terminals
-- Improved output directory handling
-- Added comprehensive documentation
-- Terminal and Batch mode integration
-- Unified CLI with `crawlier` command
-
-**v0.0.2** — Previous Release
-- Optimized crawler code
-- Professional README and documentation
-- PyPI-ready package structure
-
-**v0.0.0.1** — Initial Release
-- PC and Mobile crawling modes
-- Multi-threaded crawling
-- Basic data extraction
-
----
-
 Enjoy using Crawlier! 🚀

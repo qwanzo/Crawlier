@@ -13,6 +13,7 @@ import argparse
 # Import crawler modules
 from crawlier.app.terminal_crawler import main as terminal_main
 from crawlier.app.batch_crawler import main as batch_main
+import shlex
 
 
 def main():
@@ -27,6 +28,7 @@ Examples:
   crawlier -d example.com -m mobile --depth 5
   
   # Batch mode (process queue file)
+import io
   crawlier -b
   crawlier -b --mode mobile --threads 10
   crawlier -b --add example.com example2.com
@@ -63,6 +65,89 @@ Examples:
     parser.add_argument('--show', action='store_true',
                        help='Show current queue (batch mode)')
     
+    # Interactive mode when launched with no CLI args (e.g., double-click)
+    if len(sys.argv) == 1 and sys.stdin and sys.stdin.isatty():
+        # Show help and enter a simple REPL to accept arguments
+        print('\nCrawlier interactive mode. Type `exit` to quit.')
+        while True:
+            try:
+                parser.print_help()
+                raw = input('\ncrawlier> ').strip()
+            except (EOFError, KeyboardInterrupt):
+                print('\nExiting interactive mode')
+                return
+
+            if not raw:
+                continue
+            if raw.lower() in ('exit', 'quit'):
+                print('Goodbye')
+                return
+
+            # Allow user to ask for help
+            if raw in ('-h', '--help'):
+                parser.print_help()
+                continue
+
+            try:
+                repl_args = shlex.split(raw)
+            except Exception as e:
+                print(f"Could not parse input: {e}")
+                continue
+
+            # Temporarily parse and dispatch the command
+            try:
+                args = parser.parse_args(repl_args)
+            except SystemExit:
+                # argparse may call sys.exit(); ignore and continue REPL
+                continue
+
+            try:
+                if args.batch:
+                    batch_argv = ['batch_crawler.py']
+
+                    if args.add:
+                        batch_argv.extend(['--add'] + args.add)
+                    elif args.show:
+                        batch_argv.append('--show')
+                    else:
+                        batch_argv.append('--process')
+                        batch_argv.extend(['--mode', args.mode])
+                        batch_argv.extend(['--threads', str(args.threads)])
+                        batch_argv.extend(['--delay', str(args.delay)])
+                        batch_argv.extend(['--depth', str(args.depth)])
+                        if args.no_robots:
+                            batch_argv.append('--no-robots')
+                        batch_argv.extend(['--queue', args.queue])
+
+                    sys.argv = batch_argv
+                    batch_main()
+                else:
+                    if not args.domain:
+                        print('\n[ERROR] Terminal mode requires --domain (-d) argument')
+                        continue
+
+                    terminal_argv = ['crawlier']
+                    terminal_argv.extend(['-d', args.domain])
+                    terminal_argv.extend(['-m', args.mode])
+                    terminal_argv.extend(['-t', str(args.threads)])
+                    terminal_argv.extend(['--delay', str(args.delay)])
+                    terminal_argv.extend(['--depth', str(args.depth)])
+                    if args.no_robots:
+                        terminal_argv.append('--no-robots')
+                    terminal_argv.extend(['-o', args.output])
+                    terminal_argv.extend(['--db', args.db])
+
+                    sys.argv = terminal_argv
+                    terminal_main()
+            except KeyboardInterrupt:
+                print('\n[!] Operation interrupted by user')
+            except Exception as e:
+                print(f"\n[-] Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # End REPL
+
     args = parser.parse_args()
     
     try:
