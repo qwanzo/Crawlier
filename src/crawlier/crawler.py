@@ -21,13 +21,30 @@ from bs4 import BeautifulSoup, Comment
 from urllib.robotparser import RobotFileParser
 from collections import defaultdict, Counter
 from datetime import datetime
-import hashlib
-import sqlite3
 import csv
-import mimetypes
-from html.parser import HTMLParser
-from urllib.parse import urlparse, parse_qs, urljoin
+from urllib.parse import urlparse, urljoin
 import warnings
+
+from .storage import init_database, queue_db_insert, flush_db_buffer
+from .url_utils import normalize_url
+from .parsing import parse_html
+from .extractors import (
+    analyze_seo,
+    detect_technologies,
+    extract_emails,
+    extract_endpoints,
+    extract_files,
+    extract_forms,
+    extract_headings,
+    extract_images,
+    extract_keywords,
+    extract_metadata,
+    extract_phone_numbers,
+    extract_social_links,
+    extract_structured_data,
+    extract_videos,
+)
+
 warnings.filterwarnings('ignore')
 
 class Crawlier:
@@ -68,6 +85,12 @@ class Crawlier:
         self.url_queue = Queue()
         self.results = defaultdict(dict)
         self.lock = threading.Lock()
+        self.db_lock = threading.Lock()
+        self._queued_urls = set()
+        self._pending_db_ops = []
+        self._db_batch_size = 50
+        self._request_timestamps = {}
+        self._rate_limit_lock = threading.Lock()
         
         # Advanced data extraction storage
         self.keywords = Counter()
@@ -163,100 +186,7 @@ class Crawlier:
     
     def _init_database(self):
         """Initialize SQLite database for storing crawl data"""
-        try:
-            db_dir = os.path.dirname(self.db_file)
-            if db_dir:  # Only create directories if there's a directory path
-                os.makedirs(db_dir, exist_ok=True)
-            self.db = sqlite3.connect(self.db_file, check_same_thread=False)
-            cursor = self.db.cursor()
-            # Consolidate table creation to reduce repetition
-            table_schemas = {
-                'urls': '''
-                    CREATE TABLE IF NOT EXISTS urls (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT UNIQUE,
-                        status_code INTEGER,
-                        content_type TEXT,
-                        size INTEGER,
-                        depth INTEGER,
-                        title TEXT,
-                        description TEXT,
-                        keywords TEXT,
-                        h1_tags TEXT,
-                        response_time REAL,
-                        timestamp TEXT
-                    )
-                ''',
-                'keywords': '''
-                    CREATE TABLE IF NOT EXISTS keywords (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        keyword TEXT,
-                        frequency INTEGER,
-                        url TEXT
-                    )
-                ''',
-                'links': '''
-                    CREATE TABLE IF NOT EXISTS links (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        source_url TEXT,
-                        target_url TEXT,
-                        anchor_text TEXT,
-                        link_type TEXT
-                    )
-                ''',
-                'technologies': '''
-                    CREATE TABLE IF NOT EXISTS technologies (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT,
-                        technology TEXT,
-                        version TEXT
-                    )
-                ''',
-                'files': '''
-                    CREATE TABLE IF NOT EXISTS files (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT,
-                        file_type TEXT,
-                        file_path TEXT,
-                        file_size INTEGER
-                    )
-                ''',
-                'forms': '''
-                    CREATE TABLE IF NOT EXISTS forms (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT,
-                        action TEXT,
-                        method TEXT,
-                        fields TEXT
-                    )
-                ''',
-                'images': '''
-                    CREATE TABLE IF NOT EXISTS images (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        url TEXT,
-                        src TEXT,
-                        alt TEXT,
-                        title TEXT
-                    )
-                ''',
-                'subdomains': '''
-                    CREATE TABLE IF NOT EXISTS subdomains (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        subdomain TEXT UNIQUE,
-                        ip_address TEXT,
-                        discovered_at TEXT
-                    )
-                ''',
-            }
-
-            for name, schema in table_schemas.items():
-                cursor.execute(schema)
-
-            self.db.commit()
-            # minimized startup output
-            print("[+] Database initialized")
-        except Exception as e:
-            print(f"[-] Database initialization error: {e}")
+        init_database(self)
     
     def _load_robots_txt(self):
         """Load and parse robots.txt"""
@@ -288,6 +218,54 @@ class Crawlier:
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1'
         }
+
+    def _normalize_url(self, url):
+        """Normalize URLs so crawling and deduplication are consistent."""
+        return normalize_url(url)
+
+    def _queue_url(self, url, depth):
+        """Queue a URL only once, using normalized values for deduplication."""
+        normalized = self._normalize_url(url)
+        if not normalized:
+            return False
+
+        with self.lock:
+            if normalized in self.visited_urls or normalized in self._queued_urls:
+                return False
+            self._queued_urls.add(normalized)
+            self.url_queue.put((normalized, depth))
+            self.crawl_queue_size = max(self.crawl_queue_size, self.url_queue.qsize())
+            self.peak_queue_size = max(self.peak_queue_size, self.url_queue.qsize())
+            return True
+
+    def _queue_db_insert(self, sql, params):
+        """Buffer small database writes and commit in batches for speed."""
+        queue_db_insert(self, sql, params)
+
+    def _flush_db_buffer(self):
+        """Commit pending database operations in one transaction."""
+        flush_db_buffer(self)
+
+    def _maybe_enforce_delay(self, url):
+        """Respect a minimum per-host delay without blocking unrelated hosts."""
+        if self.delay <= 0:
+            return
+
+        hostname = urlparse(url).netloc or self.target_domain
+        with self._rate_limit_lock:
+            last_request = self._request_timestamps.get(hostname)
+            wait_time = 0.0
+            if last_request is not None:
+                wait_time = max(0.0, self.delay - (time.monotonic() - last_request))
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+        with self._rate_limit_lock:
+            self._request_timestamps[hostname] = time.monotonic()
+
+    def _parse_html(self, html_content):
+        """Parse HTML using lxml when available for better throughput."""
+        return parse_html(html_content)
     
     def enumerate_subdomains(self):
         """Enumerate subdomains using DNS queries"""
@@ -304,12 +282,10 @@ class Crawlier:
                         print(f"[+] Found subdomain: {full_domain} ({ip_address})")
                         
                         # Store in database
-                        cursor = self.db.cursor()
-                        cursor.execute('''
+                        self._queue_db_insert('''
                             INSERT OR IGNORE INTO subdomains (subdomain, ip_address, discovered_at)
                             VALUES (?, ?, ?)
                         ''', (full_domain, ip_address, datetime.now().isoformat()))
-                        self.db.commit()
                     return full_domain
             except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer, dns.exception.Timeout):
                 pass
@@ -335,411 +311,67 @@ class Crawlier:
         return list(self.found_subdomains)
     
     def extract_keywords(self, text, url, min_length=3, max_keywords=100):
-        """Extract keywords from text content"""
-        # Clean text
-        text = re.sub(r'<[^>]+>', '', text)
-        text = re.sub(r'[^\w\s]', ' ', text.lower())
-        
-        # Tokenize
-        words = text.split()
-        
-        # Filter stop words, short words, and non-ASCII gibberish
-        keywords = []
-        for w in words:
-            # Skip if too short
-            if len(w) < min_length:
-                continue
-            # Skip if stop word
-            if w in self.stop_words:
-                continue
-            # Skip if contains non-ASCII characters (likely garbage)
-            if not w.isascii():
-                continue
-            # Skip if all numbers
-            if w.isdigit():
-                continue
-            # Skip if looks like gibberish (high ratio of consonants or random chars)
-            if self._is_gibberish(w):
-                continue
-            keywords.append(w)
-        
-        # Count frequencies
-        word_freq = Counter(keywords)
-        
-        # Store in global keywords counter
-        with self.lock:
-            self.keywords.update(word_freq)
-            # Batch insert to improve performance
-            cursor = self.db.cursor()
-            rows = [(k, f, url) for k, f in word_freq.most_common(max_keywords)]
-            if rows:
-                cursor.executemany('''
-                    INSERT INTO keywords (keyword, frequency, url) VALUES (?, ?, ?)
-                ''', rows)
-                self.db.commit()
-        
-        return word_freq.most_common(max_keywords)
-    
+        """Extract keywords from text content."""
+        return extract_keywords(self, text, url, min_length=min_length, max_keywords=max_keywords)
+
     def _is_gibberish(self, word):
-        """Check if word looks like gibberish"""
-        if len(word) < 3:
-            return True
-        
-        # Count vowels
-        vowels = sum(1 for c in word if c in 'aeiou')
-        vowel_ratio = vowels / len(word)
-        
-        # If less than 20% vowels and more than 4 chars, likely gibberish
-        if vowel_ratio < 0.2 and len(word) > 4:
-            return True
-        
-        # Check for repeating patterns (like "aaa" or "xyz" repeated)
-        if len(set(word)) < len(word) / 3:
-            return True
-        
-        return False
-    
+        """Backward-compatible wrapper for the legacy helper."""
+        return extract_keywords.__globals__['_is_gibberish'](word)
+
     def extract_metadata(self, soup, url):
-        """Extract metadata from HTML"""
-        metadata = {}
-        
-        # Title
-        title_tag = soup.find('title')
-        metadata['title'] = title_tag.get_text().strip() if title_tag else ''
-        
-        # Meta tags
-        meta_tags = soup.find_all('meta')
-        for tag in meta_tags:
-            name = tag.get('name', tag.get('property', ''))
-            content = tag.get('content', '')
-            if name and content:
-                metadata[name.lower()] = content
-        
-        # Description
-        desc_tag = soup.find('meta', attrs={'name': 'description'}) or \
-                   soup.find('meta', attrs={'property': 'og:description'})
-        metadata['description'] = desc_tag.get('content', '') if desc_tag else ''
-        
-        # Keywords
-        keywords_tag = soup.find('meta', attrs={'name': 'keywords'})
-        metadata['keywords'] = keywords_tag.get('content', '') if keywords_tag else ''
-        
-        # Open Graph
-        og_tags = {}
-        for tag in meta_tags:
-            prop = tag.get('property', '')
-            if prop.startswith('og:'):
-                og_tags[prop] = tag.get('content', '')
-        metadata['open_graph'] = og_tags
-        
-        # Twitter Card
-        twitter_tags = {}
-        for tag in meta_tags:
-            name = tag.get('name', '')
-            if name.startswith('twitter:'):
-                twitter_tags[name] = tag.get('content', '')
-        metadata['twitter'] = twitter_tags
-        
-        # Canonical URL
-        canonical = soup.find('link', attrs={'rel': 'canonical'})
-        metadata['canonical'] = canonical.get('href', '') if canonical else ''
-        
-        # Language
-        html_tag = soup.find('html')
-        metadata['language'] = html_tag.get('lang', '') if html_tag else ''
-        
-        # Store in global metadata
-        with self.lock:
-            self.metadata[url] = metadata
-        
-        return metadata
-    
+        """Extract metadata from HTML."""
+        return extract_metadata(self, soup, url)
+
     def extract_headings(self, soup):
-        """Extract all heading tags"""
-        headings = defaultdict(list)
-        for i in range(1, 7):
-            tags = soup.find_all(f'h{i}')
-            headings[f'h{i}'] = [tag.get_text().strip() for tag in tags]
-        return dict(headings)
-    
+        """Extract all heading tags."""
+        return extract_headings(soup)
+
     def detect_technologies(self, soup, headers, url):
-        """Detect technologies used on the website"""
-        technologies = set()
-        
-        # Check HTML content
-        html_content = str(soup)
-        for tech, pattern in self.tech_fingerprints.items():
-            if re.search(pattern, html_content, re.IGNORECASE):
-                technologies.add(tech)
-        
-        # Check headers
-        for tech, pattern in self.tech_fingerprints.items():
-            for header, value in headers.items():
-                if re.search(pattern, f"{header}: {value}", re.IGNORECASE):
-                    technologies.add(tech)
-                    break
-        
-        # Store in database
-        with self.lock:
-            self.technologies[url].update(technologies)
-            cursor = self.db.cursor()
-            for tech in technologies:
-                cursor.execute('''
-                    INSERT INTO technologies (url, technology, version)
-                    VALUES (?, ?, ?)
-                ''', (url, tech, ''))
-            self.db.commit()
-        
-        return list(technologies)
-    
+        """Detect technologies used on the website."""
+        return detect_technologies(self, soup, headers, url)
+
     def extract_emails(self, text):
-        """Extract email addresses from text"""
-        email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-        emails = re.findall(email_pattern, text)
-        
+        """Extract email addresses from text."""
+        emails = extract_emails(text)
         with self.lock:
             self.emails.update(emails)
-        
         return emails
-    
+
     def extract_phone_numbers(self, text):
-        """Extract phone numbers from text"""
-        phone_patterns = [
-            r'\+?1?\d{9,15}',
-            r'\(\d{3}\)\s*\d{3}-\d{4}',
-            r'\d{3}-\d{3}-\d{4}',
-            r'\d{3}\.\d{3}\.\d{4}'
-        ]
-        
-        phones = []
-        for pattern in phone_patterns:
-            phones.extend(re.findall(pattern, text))
-        
+        """Extract phone numbers from text."""
+        phones = extract_phone_numbers(text)
         with self.lock:
             self.phone_numbers.update(phones)
-        
         return phones
-    
+
     def extract_social_links(self, soup, url):
-        """Extract social media links"""
-        social_platforms = {
-            'facebook': r'facebook\.com',
-            'twitter': r'twitter\.com|x\.com',
-            'instagram': r'instagram\.com',
-            'linkedin': r'linkedin\.com',
-            'youtube': r'youtube\.com',
-            'tiktok': r'tiktok\.com',
-            'pinterest': r'pinterest\.com',
-            'github': r'github\.com',
-            'reddit': r'reddit\.com'
-        }
-        
-        links = soup.find_all('a', href=True)
-        for link in links:
-            href = link['href']
-            full = urljoin(url, href)
-            for platform, pattern in social_platforms.items():
-                if re.search(pattern, full, re.IGNORECASE):
-                    with self.lock:
-                        self.social_links[platform].add(full)
-    
+        """Extract social media links."""
+        return extract_social_links(self, soup, url)
+
     def extract_forms(self, soup, url):
-        """Extract form data"""
-        forms = soup.find_all('form')
-        
-        for form in forms:
-            form_data = {
-                'url': url,
-                'action': form.get('action', ''),
-                'method': form.get('method', 'get').upper(),
-                'fields': []
-            }
-            
-            # Extract input fields
-            inputs = form.find_all(['input', 'select', 'textarea'])
-            for inp in inputs:
-                field = {
-                    'type': inp.get('type', inp.name),
-                    'name': inp.get('name', ''),
-                    'id': inp.get('id', ''),
-                    'required': inp.has_attr('required')
-                }
-                form_data['fields'].append(field)
-            
-            with self.lock:
-                self.forms.append(form_data)
-                
-                # Store in database
-                cursor = self.db.cursor()
-                cursor.execute('''
-                    INSERT INTO forms (url, action, method, fields)
-                    VALUES (?, ?, ?, ?)
-                ''', (url, form_data['action'], form_data['method'], json.dumps(form_data['fields'])))
-                self.db.commit()
-    
+        """Extract form data."""
+        return extract_forms(self, soup, url)
+
     def extract_images(self, soup, url):
-        """Extract image data"""
-        images = soup.find_all('img')
-        
-        for img in images:
-            img_data = {
-                'url': url,
-                'src': urljoin(url, img.get('src', '')),
-                'alt': img.get('alt', ''),
-                'title': img.get('title', ''),
-                'width': img.get('width', ''),
-                'height': img.get('height', '')
-            }
-            
-            with self.lock:
-                self.images.append(img_data)
-                
-                # Store in database
-                cursor = self.db.cursor()
-                cursor.execute('''
-                    INSERT INTO images (url, src, alt, title)
-                    VALUES (?, ?, ?, ?)
-                ''', (url, img_data['src'], img_data['alt'], img_data['title']))
-                self.db.commit()
-    
+        """Extract image data."""
+        return extract_images(self, soup, url)
+
     def extract_videos(self, soup, url):
-        """Extract video data"""
-        videos = soup.find_all(['video', 'iframe'])
-        
-        for video in videos:
-            video_data = {
-                'url': url,
-                'src': video.get('src', ''),
-                'type': video.name
-            }
-            
-            # Check for YouTube, Vimeo, etc.
-            if video.name == 'iframe':
-                src = video.get('src', '')
-                if 'youtube.com' in src or 'vimeo.com' in src:
-                    video_data['platform'] = 'youtube' if 'youtube' in src else 'vimeo'
-            
-            with self.lock:
-                self.videos.append(video_data)
-    
+        """Extract video data."""
+        return extract_videos(self, soup, url)
+
     def extract_structured_data(self, soup, url):
-        """Extract structured data (JSON-LD, microdata)"""
-        structured = []
-        
-        # JSON-LD
-        scripts = soup.find_all('script', type='application/ld+json')
-        for script in scripts:
-            try:
-                data = json.loads(script.string)
-                structured.append({'type': 'json-ld', 'data': data})
-            except:
-                pass
-        
-        with self.lock:
-            if structured:
-                self.structured_data.extend(structured)
-        
-        return structured
-    
+        """Extract structured data (JSON-LD, microdata)."""
+        return extract_structured_data(self, soup, url)
+
     def extract_files(self, soup, url):
-        """Extract downloadable files"""
-        file_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
-                          '.zip', '.rar', '.tar', '.gz', '.csv', '.txt', '.xml', '.json']
-        
-        links = soup.find_all('a', href=True)
-        for link in links:
-            href = link['href']
-            for ext in file_extensions:
-                if ext in href.lower():
-                    full_url = urljoin(url, href)
-                    file_type = ext[1:]
-                    
-                    with self.lock:
-                        self.files_found[file_type].append(full_url)
-                        
-                        # Store in database
-                        cursor = self.db.cursor()
-                        cursor.execute('''
-                            INSERT INTO files (url, file_type, file_path, file_size)
-                            VALUES (?, ?, ?, ?)
-                        ''', (url, file_type, full_url, 0))
-                        self.db.commit()
-                    break
-    
+        """Extract downloadable files."""
+        return extract_files(self, soup, url)
+
     def analyze_seo(self, soup, url, response):
-        """Analyze SEO factors"""
-        seo = {}
-        
-        # Title length
-        title = soup.find('title')
-        title_text = title.get_text().strip() if title else ''
-        seo['title'] = {
-            'text': title_text,
-            'length': len(title_text),
-            'optimal': 50 <= len(title_text) <= 60
-        }
-        
-        # Meta description
-        desc = soup.find('meta', attrs={'name': 'description'})
-        desc_text = desc.get('content', '') if desc else ''
-        seo['description'] = {
-            'text': desc_text,
-            'length': len(desc_text),
-            'optimal': 150 <= len(desc_text) <= 160
-        }
-        
-        # Headings
-        h1_tags = soup.find_all('h1')
-        seo['h1'] = {
-            'count': len(h1_tags),
-            'texts': [h.get_text().strip() for h in h1_tags],
-            'optimal': len(h1_tags) == 1
-        }
-        
-        # Images without alt
-        images = soup.find_all('img')
-        images_without_alt = [img for img in images if not img.get('alt')]
-        seo['images'] = {
-            'total': len(images),
-            'without_alt': len(images_without_alt),
-            'alt_percentage': (len(images) - len(images_without_alt)) / len(images) * 100 if images else 0
-        }
-        
-        # Page size
-        seo['page_size'] = {
-            'bytes': len(response.content),
-            'kb': len(response.content) / 1024,
-            'optimal': len(response.content) < 3 * 1024 * 1024  # < 3MB
-        }
-        
-        # Response time
-        seo['response_time'] = {
-            'seconds': response.elapsed.total_seconds(),
-            'optimal': response.elapsed.total_seconds() < 3
-        }
-        
-        # HTTPS
-        seo['https'] = url.startswith('https')
-        
-        # Mobile friendly meta tag
-        viewport = soup.find('meta', attrs={'name': 'viewport'})
-        seo['mobile_friendly'] = viewport is not None
-        
-        # Internal vs External links
-        links = soup.find_all('a', href=True)
-        internal = sum(1 for link in links if self.target_domain in link['href'])
-        external = len(links) - internal
-        seo['links'] = {
-            'total': len(links),
-            'internal': internal,
-            'external': external
-        }
-        
-        with self.lock:
-            self.seo_data[url] = seo
-        
-        return seo
-    
+        """Analyze SEO factors."""
+        return analyze_seo(self, soup, url, response)
+
     def detect_captcha(self, response):
         """Detect if response contains a captcha"""
         # Check status code first - Cloudflare challenges are usually 403/503
@@ -821,108 +453,34 @@ class Crawlier:
         return None
     
     def extract_endpoints(self, url, html_content):
-        """Extract endpoints from HTML content"""
-        soup = BeautifulSoup(html_content, 'html.parser')
-        endpoints = set()
-        
-        # Extract from links
-        for tag in soup.find_all(['a', 'link']):
-            href = tag.get('href')
-            if href:
-                endpoints.add(href)
-                
-                # Store links in database
-                anchor_text = tag.get_text().strip() if tag.name == 'a' else ''
-                link_type = 'internal' if self.target_domain in href else 'external'
-                
-                with self.lock:
-                    cursor = self.db.cursor()
-                    cursor.execute('''
-                        INSERT INTO links (source_url, target_url, anchor_text, link_type)
-                        VALUES (?, ?, ?, ?)
-                    ''', (url, href, anchor_text, link_type))
-                    self.db.commit()
-        
-        # Extract from scripts
-        for tag in soup.find_all('script'):
-            src = tag.get('src')
-            if src:
-                endpoints.add(src)
-        
-        # Extract from images
-        for tag in soup.find_all('img'):
-            src = tag.get('src')
-            if src:
-                endpoints.add(src)
-        
-        # Extract from forms
-        for tag in soup.find_all('form'):
-            action = tag.get('action')
-            if action:
-                endpoints.add(action)
-        
-        # Extract from inline JavaScript
-        scripts = soup.find_all('script', string=True)
-        for script in scripts:
-            # Find URLs in JavaScript
-            urls = re.findall(r'["\']([^"\']*?\.(?:html|php|asp|aspx|jsp|json|xml|js|css)[^"\']*?)["\']', 
-                            str(script.string))
-            endpoints.update(urls)
-            
-            # Find API endpoints
-            api_urls = re.findall(r'["\']/?(?:api|v\d+)/[^"\']+["\']', str(script.string))
-            api_clean = [u.strip('"\'') for u in api_urls]
-            endpoints.update(api_clean)
-            
-            with self.lock:
-                self.api_endpoints.update(api_clean)
-        
-        # Extract from comments
-        comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-        for comment in comments:
-            urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', str(comment))
-            endpoints.update(urls)
-        
-        # Normalize endpoints
-        normalized = set()
-        for endpoint in endpoints:
-            try:
-                normalized_url = urljoin(url, endpoint)
-                parsed = urlparse(normalized_url)
-                if self.target_domain in parsed.netloc or any(sub in parsed.netloc for sub in self.found_subdomains):
-                    normalized.add(normalized_url)
-                else:
-                    # Track external links
-                    with self.lock:
-                        self.external_links[url].add(normalized_url)
-            except:
-                pass
-        
-        return normalized
+        """Extract endpoints from HTML content."""
+        return extract_endpoints(self, url, html_content)
     
     def crawl_url(self, url, depth=0):
         """Crawl a single URL with comprehensive data extraction"""
-        if depth > self.max_depth:
+        normalized_url = self._normalize_url(url)
+        if not normalized_url or depth > self.max_depth:
             return
         
         with self.lock:
-            if url in self.visited_urls:
+            if normalized_url in self.visited_urls:
                 return
-            self.visited_urls.add(url)
+            self.visited_urls.add(normalized_url)
+            self._queued_urls.discard(normalized_url)
         
-        if not self._can_fetch(url):
-            print(f"[-] Blocked by robots.txt: {url}")
+        if not self._can_fetch(normalized_url):
+            print(f"[-] Blocked by robots.txt: {normalized_url}")
             print(f"[!] Tip: Use --no-robots flag to bypass (only if you have permission)")
             return
         
         try:
-            time.sleep(self.delay)
+            self._maybe_enforce_delay(normalized_url)
             
-            print(f"[*] Crawling [{depth}]: {url}")
+            print(f"[*] Crawling [{depth}]: {normalized_url}")
             
             start_time = time.time()
             response = self.session.get(
-                url, 
+                normalized_url, 
                 headers=self._get_headers(),
                 timeout=10,
                 allow_redirects=True
@@ -932,7 +490,7 @@ class Crawlier:
             # Track redirects
             if response.history:
                 with self.lock:
-                    self.redirects[url] = [r.url for r in response.history]
+                    self.redirects[normalized_url] = [self._normalize_url(r.url) for r in response.history]
             
             # Check for captcha
             if self.detect_captcha(response):
@@ -943,7 +501,7 @@ class Crawlier:
             
             # Store basic response info
             with self.lock:
-                self.results[url] = {
+                self.results[normalized_url] = {
                     'status_code': response.status_code,
                     'content_type': response.headers.get('Content-Type', ''),
                     'size': len(response.content),
@@ -962,13 +520,13 @@ class Crawlier:
                 self.content_types[content_type] += 1
                 
                 # Store headers
-                self.headers_data[url] = dict(response.headers)
+                self.headers_data[normalized_url] = dict(response.headers)
                 
                 # Store cookies
-                self.cookies_data[url] = dict(response.cookies)
+                self.cookies_data[normalized_url] = dict(response.cookies)
                 
                 # Performance metrics
-                self.performance_metrics[url] = {
+                self.performance_metrics[normalized_url] = {
                     'response_time': response_time,
                     'size': len(response.content),
                     'size_kb': len(response.content) / 1024
@@ -976,56 +534,55 @@ class Crawlier:
             
             # Only process HTML content
             if 'text/html' in response.headers.get('Content-Type', ''):
-                print(f"[+] Processing HTML content from {url}")
-                soup = BeautifulSoup(response.text, 'html.parser')
+                print(f"[+] Processing HTML content from {normalized_url}")
+                soup = self._parse_html(response.text)
                 
                 # Extract all data FIRST, before endpoint extraction
                 print(f"    → Extracting metadata...")
-                metadata = self.extract_metadata(soup, url)
+                metadata = self.extract_metadata(soup, normalized_url)
                 print(f"    → Extracting headings...")
                 headings = self.extract_headings(soup)
                 print(f"    → Extracting emails and phones...")
                 self.extract_emails(response.text)
                 self.extract_phone_numbers(response.text)
                 print(f"    → Extracting social links...")
-                self.extract_social_links(soup, url)
+                self.extract_social_links(soup, normalized_url)
                 print(f"    → Extracting forms...")
-                self.extract_forms(soup, url)
+                self.extract_forms(soup, normalized_url)
                 print(f"    → Extracting images...")
-                self.extract_images(soup, url)
+                self.extract_images(soup, normalized_url)
                 print(f"    → Extracting videos...")
-                self.extract_videos(soup, url)
+                self.extract_videos(soup, normalized_url)
                 print(f"    → Extracting structured data...")
-                self.extract_structured_data(soup, url)
+                self.extract_structured_data(soup, normalized_url)
                 print(f"    → Extracting files...")
-                self.extract_files(soup, url)
+                self.extract_files(soup, normalized_url)
                 print(f"    → Analyzing SEO...")
-                seo = self.analyze_seo(soup, url, response)
+                seo = self.analyze_seo(soup, normalized_url, response)
                 
                 # Extract keywords from visible text
                 print(f"    → Extracting keywords...")
-                keywords = self.extract_keywords(response.text, url)
+                keywords = self.extract_keywords(response.text, normalized_url)
                 print(f"    → Found {len(keywords)} unique keywords")
                 
                 # Detect technologies
                 print(f"    → Detecting technologies...")
-                technologies = self.detect_technologies(soup, response.headers, url)
+                technologies = self.detect_technologies(soup, response.headers, normalized_url)
                 if technologies:
                     print(f"    → Detected: {', '.join(technologies)}")
                 
                 # Store page content
                 with self.lock:
-                    self.page_content[url] = soup.get_text()[:10000]  # First 10k chars
+                    self.page_content[normalized_url] = soup.get_text(' ', strip=True)[:10000]  # First 10k chars
                 
                 # Store in database
                 try:
-                    cursor = self.db.cursor()
-                    cursor.execute('''
+                    self._queue_db_insert('''
                         INSERT OR REPLACE INTO urls 
                         (url, status_code, content_type, size, depth, title, description, keywords, h1_tags, response_time, timestamp)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        url, 
+                        normalized_url, 
                         response.status_code,
                         response.headers.get('Content-Type', ''),
                         len(response.content),
@@ -1037,14 +594,13 @@ class Crawlier:
                         response_time,
                         datetime.now().isoformat()
                     ))
-                    self.db.commit()
                     print(f"    → Saved to database")
                 except Exception as e:
-                    print(f"[!] Database error for {url}: {e}")
+                    print(f"[!] Database error for {normalized_url}: {e}")
                 
                 # Extract and queue new endpoints (do this LAST)
                 print(f"    → Discovering new endpoints...")
-                endpoints = self.extract_endpoints(url, response.text)
+                endpoints = self.extract_endpoints(normalized_url, response.text)
                 print(f"    → Found {len(endpoints)} endpoints")
                 
                 with self.lock:
@@ -1053,8 +609,7 @@ class Crawlier:
                 # Add new endpoints to queue for crawling
                 new_urls = 0
                 for endpoint in endpoints:
-                    if endpoint not in self.visited_urls:
-                        self.url_queue.put((endpoint, depth + 1))
+                    if self._queue_url(endpoint, depth + 1):
                         new_urls += 1
                 
                 if new_urls > 0:
@@ -1068,24 +623,24 @@ class Crawlier:
             error_type = type(e).__name__
             with self.lock:
                 self.errors[error_type] += 1
-                self.results[url] = {
+                self.results[normalized_url] = {
                     'error': str(e),
                     'error_type': error_type,
                     'depth': depth,
                     'timestamp': datetime.now().isoformat()
                 }
-            print(f"[-] Error crawling {url}: {e}")
+            print(f"[-] Error crawling {normalized_url}: {e}")
         except Exception as e:
             error_type = type(e).__name__
             with self.lock:
                 self.errors[error_type] += 1
-                self.results[url] = {
+                self.results[normalized_url] = {
                     'error': str(e),
                     'error_type': error_type,
                     'depth': depth,
                     'timestamp': datetime.now().isoformat()
                 }
-            print(f"[-] Unexpected error at {url}: {e}")
+            print(f"[-] Unexpected error at {normalized_url}: {e}")
     
     def worker(self):
         """Worker thread for crawling"""
@@ -1097,6 +652,8 @@ class Crawlier:
                     self.peak_queue_size = max(self.peak_queue_size, current_queue_size)
                 
                 url, depth = self.url_queue.get(timeout=5)
+                with self.lock:
+                    self._queued_urls.discard(url)
                 self.crawl_url(url, depth)
                 self.url_queue.task_done()
             except:
@@ -1123,7 +680,7 @@ class Crawlier:
         start_urls.extend([f"https://{sub}" for sub in subdomains])
         
         for url in start_urls:
-            self.url_queue.put((url, 0))
+            self._queue_url(url, 0)
         
         # Step 3: Start worker threads
         threads = []
@@ -1140,6 +697,7 @@ class Crawlier:
         for thread in threads:
             thread.join(timeout=1)
         
+        self._flush_db_buffer()
         self.crawl_end_time = time.time()
         
         print(f"\n{'='*60}")
